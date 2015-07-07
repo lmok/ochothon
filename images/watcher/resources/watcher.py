@@ -60,19 +60,17 @@ def watch(watching=['*'], period=300.0, wait=10.0, checks=3, timeout=20.0):
 
     allowed = ['running']
 
-    proxy = ZK.start([node for node in os.environ['OCHOPOD_ZK'].split(',')])
+    store = {cluster: [checks, {}] for cluster in watching}
 
-    try:
+    while True:
 
-        store = {cluster: [checks, {}] for cluster in watching}
+        proxy = ZK.start([node for node in os.environ['OCHOPOD_ZK'].split(',')])
 
-        while True:
+        try:
 
             #
             # - Poll clusters every period and log consecutive health check failures
             #
-            time.sleep(period)
-
             for i in range(checks+1):
 
                 for cluster in watching:
@@ -121,13 +119,15 @@ def watch(watching=['*'], period=300.0, wait=10.0, checks=3, timeout=20.0):
 
                 time.sleep(wait)
 
-    except Exception as e:
+            time.sleep(period)
 
-        raise e
+        except Exception as e:
 
-    finally:
+            raise e
 
-        shutdown(portal)
+        finally:
+
+            shutdown(proxy)
 
 if __name__ == '__main__':
 

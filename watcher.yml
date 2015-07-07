@@ -1,0 +1,9 @@
+cluster:  watcher
+image:    lmok/pod-watcher
+
+
+verbatim:
+  cpus: 0.25
+  mem: 64
+  env:
+    DAYCARE: "<CLUSTER GLOB PATTERN #1>,<CLUSTER GLOB PATTERN #2>..."
