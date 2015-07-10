@@ -1,0 +1,9 @@
+cluster:  scaler
+image:    lmok/pod-scaler
+
+
+verbatim:
+  cpus: 0.25
+  mem: 128
+  env:
+    SCALEES: "<CLUSTER GLOB PATTERN #1>,<CLUSTER GLOB PATTERN #2>..."
