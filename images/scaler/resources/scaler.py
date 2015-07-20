@@ -325,6 +325,7 @@ def simplescale(remote, clusters, period=300.0):
 def pulse(remote, clusters, period=300.0):
     """
         Scales cluster up and down periodically
+
         :param remote: function used to pass toolset commands to the portal
         :param clusters: list of strings matching particular namespace/clusters for scaling
         :param period: period (secs) between pulses
