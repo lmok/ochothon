@@ -23,32 +23,9 @@ from os import environ
 from os.path import basename, expanduser, isfile
 from subprocess import Popen, PIPE
 from ochopod.core.fsm import diagnostic
-from ochopod.core.utils import retry
+from ochopod.core.utils import retry, shell
 
 logger = logging.getLogger('ochopod')
-
-def shell(snippet):
-    """
-        Helper invoking a shell command and returning its stdout broken down by lines as a list. The sub-process
-        exit code is also returned. Since it's crucial to see what's going on when troubleshooting Jenkins the
-        shell command output is logged line by line.
-        :type snippet: str
-        :param snippet: shell snippet, e.g "echo foo > /bar"
-        :rtype: (int, list) 2-uple
-    """
-
-    out = []
-    logger.debug('shell> %s' % snippet)
-    pid = Popen(snippet, shell=True, stdout=PIPE, stderr=PIPE)
-    while pid.poll() is None:
-        stdout = pid.stdout.readline()
-        out += [stdout]
-        line = stdout[:-1]
-        if line:
-            logger.debug('shell> %s' % (line if len(line) < 80 else '%s...' % line[:77]))
-
-    code = pid.returncode
-    return code, out
 
 def output(js, cluster):
     """
@@ -58,7 +35,9 @@ def output(js, cluster):
     """
 
     if not js['ok']:
-        logger.warning('Communication with portal failed when trying to scale clusters under %s.' % cluster)
+
+        logger.warning('Communication with portal when trying to scale clusters under %s FAILED.' % cluster)
+        return
 
     outs = json.loads(js['out'])
     failed = any(['failed' in scaled for key, scaled in outs.iteritems()])
@@ -118,16 +97,16 @@ def proxyscale(remote, clusters, haproxies, period=300.0, reps=5):
     # - Unit and limits by and to which instance number is scaled
     #
     unit =  1
-    lim =  200
+    lim =  20
 
     #
     # - Max and min acceptable session rate (sessions/second -- see HAProxy stats parameters) PER POD
     # - Max and min acceptable response rate (threaded response/second) per POD if using flask samples
     #
-    ceiling_sessions = 5
-    floor_sessions = 1
-    ceiling_threads = 5
-    floor_threads = 2
+    ceiling_sessions = 15
+    floor_sessions = 5
+    ceiling_threads = 15
+    floor_threads = 5
 
     #
     # - Check stats this many times to get an average of session rate (since HAProxy only uses 1 second intervals)
@@ -151,20 +130,80 @@ def proxyscale(remote, clusters, haproxies, period=300.0, reps=5):
 
             #
             # - Get haproxy... hardcoded for now
-            # - TODO: Ask olivier about json output for port command
             #
             haproxy = haproxies[i]
-            url = environ['CHEAT']
+            js = remote('port 9002 %s -j' % haproxy)
 
-            # Average sessions/second rate over reps # of repetitions
+            if not js['ok']:
+
+                logger.warning('Communication with portal when looking for HAproxy %s FAILED' % haproxy)
+                continue
+
+            outs = json.loads(js['out'])
+
+            if not len(outs) == 1:
+
+                logger.warning('Did not find 1 HAProxy under %s (found %d)' % (haproxy, len(outs)))
+                continue
+            
+            key = outs.keys()[0]
+
+            url = '%s:%s' % (outs[key]['ip'], outs[key]['ports'])
+
+            #
+            # - Average sessions/second rate over reps # of repetitions
+            #
             avg_sessions = 0
-            # Average number of open threads in Flask servers over reps # of repetitions
+            
+            #
+            # - Average number of open threads in Flask servers over reps # of repetitions
+            #
             avg_threads = 0
+            
+            #
+            # - Number of Flasks
+            #
             num = 0
 
             for i in range(reps):
 
                 time.sleep(1)
+
+                #
+                # - Number of pods up & number of pods with running sub processes
+                #
+                js = remote('grep %s -j' % cluster)
+                
+                if not js['ok']:
+
+                    logger.warning('Communication with portal during pre-scale grep FAILED.')
+                    continue
+
+                outs = json.loads(js['out'])
+                ok = sum(1 for key, data in outs.iteritems() if data['process'] == 'running')
+                num = len(outs)
+                
+                #
+                # - Nothing is running yet, try again next time
+                #
+                if ok == 0:
+
+                    logger.warning('Did not find running scalees.')
+                    continue
+                
+                #
+                # - Running average for threads
+                #
+                js = remote('poll %s -j' % cluster)
+                
+                if not js['ok']:
+
+                    logger.warning('Communication with portal during metrics gathering FAILED.')
+                    continue
+                
+                outs = json.loads(js['out'])
+                threads = sum(item['threads'] for key, item in outs.iteritems() if 'threads' in item)
+                avg_threads = avg_threads + (float(threads)/ok - avg_threads)/(i + 1)
 
                 #
                 # - Get the stats from HAproxy
@@ -180,37 +219,12 @@ def proxyscale(remote, clusters, haproxies, period=300.0, reps=5):
                     return dict(zip(lines[0], filter(lambda x: x[0] == 'local' and x[1] == 'BACKEND', lines)[0]))
 
                 #
-                # - Running average
+                # - Running average for session rate
                 #
                 backend = _backend()
-                avg_sessions = avg_sessions + (float(backend['rate']) - avg_sessions)/(i + 1)
+                avg_sessions = avg_sessions + (float(backend['rate'])/ok - avg_sessions)/(i + 1)
 
-                #
-                # - Number of pods up
-                # - TODO ask olivier for json output for grep command... use poll for now
-                #
-                js = remote('poll %s -j' % cluster)
-                
-                if not js['ok']:
-                    logger.warning('Communication with portal during metrics collection failed.')
-                    continue
-
-                mets = json.loads(js['out'])
-
-                num = sum(1 for key in mets.keys())
-
-                threads = sum(float(item['threads']) for key, item in mets.iteritems() if 'threads' in item)
-
-                avg_threads = avg_threads + (threads - avg_threads)/(i + 1)
-
-            #
-            # - Not everything is running yet, try again next time
-            #
-            if num == 0:
-
-                continue
-
-            logger.info('Scaler gathered metrics for %s --> average session rate: %d, average thread rate: %d' % (cluster, avg_sessions/num, avg_threads/num))
+            logger.info('Scaler gathered metrics for %s --> average session rate: %d, average thread rate: %d' % (cluster, avg_sessions, avg_threads))
 
             #
             # - Scale up/down based on how stressed the cluster is and if resources
@@ -218,14 +232,14 @@ def proxyscale(remote, clusters, haproxies, period=300.0, reps=5):
             #
             js = {}
 
-            if avg_sessions/num > ceiling_sessions and avg_threads/num > ceiling_threads and num + unit <= lim:
+            if (avg_sessions > ceiling_sessions or avg_threads > ceiling_threads) and num + unit <= lim:
 
-                    js = remote('scale %s -i %d -j' % (cluster, len(mets) + unit))
+                    js = remote('scale %s -i %d -j' % (cluster, num + unit))
                     recent = True
 
-            elif avg_sessions/num < floor_sessions and avg_threads/num < floor_threads and num > unit:
+            elif avg_sessions < floor_sessions and avg_threads < floor_threads and num > unit:
                     
-                    js = remote('scale %s -i %d -j' % (cluster, len(mets) - unit))
+                    js = remote('scale %s -i %d -j' % (cluster, num - unit))
                     recent = True
 
             else:
