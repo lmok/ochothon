@@ -60,8 +60,6 @@ def watch(remote, watching=['*'], period=300.0, wait=10.0, checks=3, timeout=20.
 
     while True:
 
-        proxy = ZK.start([node for node in environ['OCHOPOD_ZK'].split(',')])
-
         try:
 
             #
@@ -74,12 +72,15 @@ def watch(remote, watching=['*'], period=300.0, wait=10.0, checks=3, timeout=20.
                     #
                     # - Poll health of pod's subprocess
                     #
-                    def _query(zk):
-                        replies = fire(zk, cluster, 'info')
-                        return len(replies), {key: (hints['process'] if code == 200 else code) for key, (index, hints, code) in replies.items()}
+                    js = remote('grep %s -j' % cluster)
 
-                    length, js = run(proxy, _query, timeout)
-                    good = sum(1 for key, process in js.iteritems() if str(process) in allowed)
+                    if not js['ok']:
+                        logger.warning('Communication with portal during metrics collection failed.')
+                        continue
+
+                    data = json.loads(js['out'])
+
+                    good = sum(1 for key, status in data.iteritems() if status['process'] in allowed)
 
                     #
                     # - Health of cluster is fine: reset stored health check
