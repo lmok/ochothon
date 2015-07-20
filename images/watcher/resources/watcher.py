@@ -16,17 +16,13 @@
 #
 import json
 import logging
-import ochopod
-import os
-import pykka
 import sys
-import tempfile
 import time
-import shutil
 import pprint
-
+from os import environ
+from os.path import basename, expanduser, isfile
 from ochopod.core.fsm import diagnostic, shutdown
-from toolset.io import fire, run, ZK
+from ochopod.core.utils import retry, shell
 
 logger = logging.getLogger('ochopod')
 
@@ -46,7 +42,7 @@ def reassure(cluster, js, checks):
     message = 'Clusters under %s: changed status; health OK.\n-----Process status-----:\n%s' % (cluster, pprint.pformat(js))
     logger.info(message)
 
-def watch(watching=['*'], period=300.0, wait=10.0, checks=3, timeout=20.0):
+def watch(remote, watching=['*'], period=300.0, wait=10.0, checks=3, timeout=20.0):
     """
         Watches a list of clusters for failures in health checks (defined as non-running process status). This fires a number of checks
         every period with a wait between each check. E.g. it can check 3 times every 5-minute period with a 10 second wait between checks.
@@ -64,7 +60,7 @@ def watch(watching=['*'], period=300.0, wait=10.0, checks=3, timeout=20.0):
 
     while True:
 
-        proxy = ZK.start([node for node in os.environ['OCHOPOD_ZK'].split(',')])
+        proxy = ZK.start([node for node in environ['OCHOPOD_ZK'].split(',')])
 
         try:
 
@@ -138,9 +134,8 @@ if __name__ == '__main__':
         # - enable CLI logging
         # - pass down the ZK ensemble coordinate
         #
-        env = os.environ
+        env = environ
         hints = json.loads(env['ochopod'])
-        ochopod.enable_cli_log(debug=hints['debug'] == 'true')
         env['OCHOPOD_ZK'] = hints['zk']
 
         #
@@ -149,8 +144,39 @@ if __name__ == '__main__':
         clusters = ['*']
         if 'DAYCARE' in env:
             clusters = env['DAYCARE'].split(',')
+
+        #
+        # - Get the portal that we found during cluster configuration (see pod/pod.py)
+        #
+        _, lines = shell('cat /opt/scaler/.portal')
+        portal = lines[0]
+        assert portal, '/opt/scaler/.portal not found (pod not yet configured ?)'
+        logger.debug('using proxy @ %s' % portal)
+
+        #
+        # - Remote for direct communication with the portal
+        #
+        def _remote(cmdline):
+
+            #
+            # - this block is taken from cli.py in ochothon
+            # - in debug mode the verbatim response from the portal is dumped on stdout
+            #
+            now = time.time()
+            tokens = cmdline.split(' ')
+            files = ['-F %s=@%s' % (basename(token), expanduser(token)) for token in tokens if isfile(expanduser(token))]
+            line = ' '.join([basename(token) if isfile(expanduser(token)) else token for token in tokens])
+            logger.debug('"%s" -> %s' % (line, portal))
+            snippet = 'curl -X POST -H "X-Shell:%s" %s %s/shell' % (line, ' '.join(files), portal)
+            code, lines = shell(snippet)
+            assert code is 0, 'i/o failure (is the proxy portal down ?)'
+            js = json.loads(lines[0])
+            elapsed = time.time() - now
+            logger.debug('<- %s (took %.2f seconds) ->\n\t%s' % (portal, elapsed, '\n\t'.join(js['out'].split('\n'))))
+            return js
         
-        watch(clusters)        
+        # Run the watcher routine
+        watch(_remote, clusters)        
 
     except Exception as failure:
 
