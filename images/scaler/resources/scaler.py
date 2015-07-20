@@ -18,10 +18,12 @@ import json
 import logging
 import sys
 import time
+import requests
 from os import environ
 from os.path import basename, expanduser, isfile
 from subprocess import Popen, PIPE
 from ochopod.core.fsm import diagnostic
+from ochopod.core.utils import retry
 
 logger = logging.getLogger('ochopod')
 
@@ -50,7 +52,9 @@ def shell(snippet):
 
 def output(js, cluster):
     """
-        Lightweight helper for logging results from scale requests.
+        Helper for logging results from scale requests.
+        :param js: jsonified output returned from a request to the portal using shell().
+        :param cluster: the glob pattern used to match a cluster
     """
 
     if not js['ok']:
@@ -62,17 +66,181 @@ def output(js, cluster):
     if failed:
 
         import pprint
-        logger.warning('Scaling %s failed. Report:\n%s' % (cluster, pprint.pformat(outs)))
+        logger.warning('Scaling %s FAILURE. Report:\n%s' % (cluster, pprint.pformat(outs)))
 
     else:
 
         for name, data in outs.iteritems():
 
-            logger.info('Scaled: %d/%d pods are running under %s' % (data['running'], data['requested'], name))
+            logger.info('Scaling %s SUCCESS. %d/%d pods are running under %s' % (cluster, data['running'], data['requested'], name))
 
-def autoscale(remote, clusters, period=300.0):
+def proxyscale(remote, clusters, haproxies, period=300.0, reps=5):
     """
-        Scales the cluster automatically.
+        Scales clusters under provided cluster glob patterns according to their load. This is checked through HAproxy pods.
+
+        This example also uses user-defined metrics; the scalees have threaded Flask servers that keep track of the number of open 
+        threaded requests at a /threads endpoint. The sanity_check() metrics are::
+
+            from random import choice
+            from ochopod.core.utils import merge, retry
+
+            cwd = '/opt/flask'
+            checks = 5
+            check_every = 1
+            metrics = True
+
+            def sanity_check(self, pid):
+                
+                #
+                # - Randomly decide to be stressed  
+                # - Curl to Flask in the subprocess to check number of threaded requests running.
+                #
+                @retry(timeout=30.0, pause=0)
+                def _self_curl():
+                    reply = get('http://localhost:9000/threads')
+                    code = reply.status_code
+                    assert code == 200 or code == 201, 'Self curling failed'
+                    return merge({'stressed': choice(['Very', 'Nope'])}, json.loads(reply.text))
+
+                return _self_curl()
+
+        General usage for this function:
+        :param remote: function used to pass toolset commands to the portal
+        :param clusters: list of glob patterns matching particular namespace/clusters for scaling
+        :param haproxies: list of glob patterns matching haproxies corresponding to each scalee cluster
+        :param period: period (secs) to wait before polling for metrics and scaling
+        :param reps: int number of 1-second poll repetitions to get stats from HAProxy
+    """ 
+
+    assert period > reps, "A period of %d seconds doesn't allow for %d x 1 second polling repetitions." % (period, reps)
+
+    #
+    # - Unit and limits by and to which instance number is scaled
+    #
+    unit =  1
+    lim =  200
+
+    #
+    # - Max and min acceptable session rate (sessions/second -- see HAProxy stats parameters) PER POD
+    # - Max and min acceptable response rate (threaded response/second) per POD if using flask samples
+    #
+    ceiling_sessions = 5
+    floor_sessions = 1
+    ceiling_threads = 5
+    floor_threads = 2
+
+    #
+    # - Check stats this many times to get an average of session rate (since HAProxy only uses 1 second intervals)
+    # - I.e. 5 repetitions averages session rates 5 times with a 1 sec sleep between
+    #
+    reps = 5
+
+    #
+    # - If pods were recently scaled, sleep for half the time to re-poll cluster status quickly
+    #
+    recent = False
+
+    while True:
+
+        #
+        # - Wait for period minus polling reps
+        #
+        time.sleep(period - reps if not recent else period/2 - reps)
+        
+        for i, cluster in enumerate(clusters):
+
+            #
+            # - Get haproxy... hardcoded for now
+            # - TODO: Ask olivier about json output for port command
+            #
+            haproxy = haproxies[i]
+            url = environ['CHEAT']
+
+            # Average sessions/second rate over reps # of repetitions
+            avg_sessions = 0
+            # Average number of open threads in Flask servers over reps # of repetitions
+            avg_threads = 0
+            num = 0
+
+            for i in range(reps):
+
+                time.sleep(1)
+
+                #
+                # - Get the stats from HAproxy
+                # - This will put the csv-formatted stats for the BACKEND servers into a nice little dict 
+                # - Look at the haproxy pod for more info (frontend.cfg and local.cfg) 
+                #
+                @retry(timeout=30.0, pause=0)
+                def _backend():   
+                    reply = requests.get('http://%s/;csv' % url, auth=('olivier', 'likeschinesefood'))
+                    code = reply.status_code
+                    assert code == 200 or code == 201, 'Polling HAProxy failed (HTTP %d)' % code
+                    lines = map(lambda x: x.split(','), reply.text.splitlines())
+                    return dict(zip(lines[0], filter(lambda x: x[0] == 'local' and x[1] == 'BACKEND', lines)[0]))
+
+                #
+                # - Running average
+                #
+                backend = _backend()
+                avg_sessions = avg_sessions + (float(backend['rate']) - avg_sessions)/(i + 1)
+
+                #
+                # - Number of pods up
+                # - TODO ask olivier for json output for grep command... use poll for now
+                #
+                js = remote('poll %s -j' % cluster)
+                
+                if not js['ok']:
+                    logger.warning('Communication with portal during metrics collection failed.')
+                    continue
+
+                mets = json.loads(js['out'])
+
+                num = sum(1 for key in mets.keys())
+
+                threads = sum(float(item['threads']) for key, item in mets.iteritems() if 'threads' in item)
+
+                avg_threads = avg_threads + (threads - avg_threads)/(i + 1)
+
+            #
+            # - Not everything is running yet, try again next time
+            #
+            if num == 0:
+
+                continue
+
+            logger.info('Scaler gathered metrics for %s --> average session rate: %d, average thread rate: %d' % (cluster, avg_sessions/num, avg_threads/num))
+
+            #
+            # - Scale up/down based on how stressed the cluster is and if resources
+            # - are within the limits
+            #
+            js = {}
+
+            if avg_sessions/num > ceiling_sessions and avg_threads/num > ceiling_threads and num + unit <= lim:
+
+                    js = remote('scale %s -i %d -j' % (cluster, len(mets) + unit))
+                    recent = True
+
+            elif avg_sessions/num < floor_sessions and avg_threads/num < floor_threads and num > unit:
+                    
+                    js = remote('scale %s -i %d -j' % (cluster, len(mets) - unit))
+                    recent = True
+
+            else:
+                    recent = False
+
+            #
+            # - Output for calls to scale
+            #
+            if not js == {}:
+
+                output(js, cluster)
+
+def simplescale(remote, clusters, period=300.0):
+    """
+        Scales the cluster automatically with a simple routine.
 
         This particular example is meant to scale a cluster of pods with this config in its lifecycle::
 
@@ -96,13 +264,9 @@ def autoscale(remote, clusters, period=300.0):
         :param period: period (secs) to wait before polling for metrics and scaling
     """
 
-    unit = {
-        'instances': 1,
-    }   
+    unit =  1
 
-    lim = {
-        'instances': 4,
-    }
+    lim =  4
 
     while True:
 
@@ -129,13 +293,13 @@ def autoscale(remote, clusters, period=300.0):
             #
             js = {}
 
-            if stressed > len(mets)/2.0 and len(mets) + unit['instances'] <= lim['instances']:
+            if stressed > len(mets)/2.0 and len(mets) + unit <= lim:
 
-                    js = remote('scale %s -i %d -j' % (cluster, len(mets) + unit['instances']))
+                    js = remote('scale %s -i %d -j' % (cluster, len(mets) + unit))
 
-            elif stressed < len(mets)/2.0 and len(mets) > unit['instances']:
+            elif stressed < len(mets)/2.0 and len(mets) > unit:
                     
-                    js = remote('scale %s -i %d -j' % (cluster, len(mets) - unit['instances']))
+                    js = remote('scale %s -i %d -j' % (cluster, len(mets) - unit))
 
             #
             # - Output for calls to scale
@@ -196,11 +360,13 @@ if __name__ == '__main__':
         env['OCHOPOD_ZK'] = hints['zk']
         
         #
-        # - Check for passed set of scalee clusters in deployment yaml
+        # - Check for passed set of scalee clusters, haproxies, and time period in deployment yaml
         #
-        clusters = []
-        if 'SCALEES' in env:
-            clusters = env['SCALEES'].split(',')
+        clusters = env['SCALEES'].split(',') if 'SCALEES' in env else []
+
+        haproxies = env['HAPROXIES'].split(',') if 'HAPROXIES' in env else []
+            
+        period = float(env['PERIOD']) if 'PERIOD' in env else 60
 
         #
         # - Get the portal that we found during cluster configuration (see pod/pod.py)
@@ -233,7 +399,7 @@ if __name__ == '__main__':
             return js
 
         # Use our very simple autoscaling routine
-        autoscale(_remote, clusters, 30.0)
+        proxyscale(_remote, clusters, haproxies, period)
 
     except Exception as failure:
 
