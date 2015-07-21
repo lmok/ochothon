@@ -1,4 +1,4 @@
-FROM lmok/pod
+FROM autodeskcloud/pod:1.0.2
 
 #
 # - add pip, pyyaml & redis
