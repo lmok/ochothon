@@ -42,7 +42,7 @@ def reassure(cluster, js, checks):
     message = 'Clusters under %s: changed status; health OK.\n-----Process status-----:\n%s' % (cluster, pprint.pformat(js))
     logger.info(message)
 
-def watch(remote, watching=['*'], period=300.0, wait=10.0, checks=3, timeout=20.0):
+def watch(remote, watching=['*'], period=120.0, wait=10.0, checks=3, timeout=20.0):
     """
         Watches a list of clusters for failures in health checks (defined as non-running process status). This fires a number of checks
         every period with a wait between each check. E.g. it can check 3 times every 5-minute period with a 10 second wait between checks.
@@ -56,16 +56,17 @@ def watch(remote, watching=['*'], period=300.0, wait=10.0, checks=3, timeout=20.
 
     allowed = ['running']
 
-    store = {cluster: [checks, {}] for cluster in watching}
+    store = {cluster: {'remaining': checks, 'stagnant': False, 'data': {}} for cluster in watching}
+    store_indeces = {cluster: {} for cluster in watching}
+    
+    try:
 
-    while True:
-
-        try:
+        while True:
 
             #
             # - Poll clusters every period and log consecutive health check failures
             #
-            for i in range(checks+1):
+            for i in range(checks + 1):
 
                 for cluster in watching:
 
@@ -75,6 +76,7 @@ def watch(remote, watching=['*'], period=300.0, wait=10.0, checks=3, timeout=20.
                     js = remote('grep %s -j' % cluster)
 
                     if not js['ok']:
+
                         logger.warning('Communication with portal during metrics collection failed.')
                         continue
 
@@ -82,49 +84,113 @@ def watch(remote, watching=['*'], period=300.0, wait=10.0, checks=3, timeout=20.
 
                     good = sum(1 for key, status in data.iteritems() if status['process'] in allowed)
 
+                    if len(data) == 0:
+
+                        logger.warning('Did not find any pods under %s.' % cluster)
+                        continue
                     #
-                    # - Health of cluster is fine: reset stored health check
+                    # - Check indeces of pods; warn anyway if indeces have jumped even if health is fine
+                    # - store current indeces in dict of key: [list of found indeces]
                     #
-                    if length == good:
+                    curr_indeces = {}
 
-                        if store[cluster][1] != js:
+                    for key in data.keys():
+                        
+                        #
+                        # - Some extraneous split/joins in case user has used ' #' in namespace
+                        #
+                        index = int(key.split(' #')[-1])
+                        name = ' #'.join(key.split(' #')[:-1])
 
-                            reassure(cluster, js, checks)
+                        curr_indeces[name] = [index] if name not in curr_indeces else curr_indeces[name] + [index]
 
-                        store[cluster] = [checks, js]
+                    for key, indeces in curr_indeces.iteritems():
+
+                        #
+                        # - First time cluster has been observed
+                        #
+                        if not key in store_indeces[cluster]:
+
+                            store_indeces[cluster][key] = indeces
+                            continue
+
+                        #
+                        # - The base index has changed (not supposed to happen even when scaling to an instance # > 0)
+                        #
+                        base_index = sorted(store_indeces[cluster][key])[0]
+
+                        if base_index not in indeces:
+
+                            logger.warning('Previous lowest index for %s (#%d) has changed (now #%d).' % (key, base_index, sorted(indeces)[0]))
+
+                        #
+                        # - Some previously-stored indeces have disappeared
+                        #
+                        delta = set(store_indeces[cluster][key]) - set(indeces)
+                        
+                        if delta:
+
+                            logger.warning('Previous indeces for %s (#%s) have been lost.' %(key, ', #'.join(map(str, delta))))
+
+                        #
+                        # Update the stored indeces with current list
+                        #
+                        store_indeces[cluster][key] = indeces
+
+                    #
+                    # - Health of cluster is fine: reset stored health check count and data
+                    #
+                    if len(data) == good:
+
+                        if store[cluster]['data'] != data:
+
+                            reassure(cluster, data, checks)
+
+                        store[cluster]['data'] = data
+                        store[cluster]['remaining'] = checks
 
                     #
                     # - Cluster not in good health and has not changed since last check: decrease check allowance
                     #
-                    elif store[cluster][1] == js:
+                    elif store[cluster]['data'] == data:
 
-                        store[cluster] = [store[cluster][0] - 1, js]
+                        store[cluster]['remaining'] -= 1
+                        store[cluster]['stagnant'] = True
 
                     #
                     # - Cluster not in good health but status has changed: update stored health check
                     #
                     else:
 
-                        store[cluster][1] = js
-
-                    #
-                    # - Check allowance exceeded; send warning message
-                    #
-                    if not store[cluster][0] > 0:
-
-                        alert(cluster, js, checks)
+                        store[cluster]['data'] = data
+                        store[cluster]['stagnant'] = False
 
                 time.sleep(wait)
 
+            #
+            # - Check allowance exceeded for each cluster; send warning messages
+            #
+            for cluster, stored in store.iteritems():
+                
+                if not stored['remaining'] > 0:
+
+                    alert(cluster, stored['data'], checks)
+
+                #
+                # - Reset checks count for next period
+                #
+                store[cluster]['remaining'] = checks
+
             time.sleep(period)
 
-        except Exception as e:
+    except Exception as failure:
 
-            raise e
+        logger.fatal('Error on line %s' % (sys.exc_info()[-1].tb_lineno))
+        logger.fatal('unexpected condition -> %s' % failure)
 
-        finally:
+    finally:
 
-            shutdown(proxy)
+        sys.exit(1)
 
 if __name__ == '__main__':
 
@@ -149,9 +215,9 @@ if __name__ == '__main__':
         #
         # - Get the portal that we found during cluster configuration (see pod/pod.py)
         #
-        _, lines = shell('cat /opt/scaler/.portal')
+        _, lines = shell('cat /opt/watcher/.portal')
         portal = lines[0]
-        assert portal, '/opt/scaler/.portal not found (pod not yet configured ?)'
+        assert portal, '/opt/watcher/.portal not found (pod not yet configured ?)'
         logger.debug('using proxy @ %s' % portal)
 
         #
