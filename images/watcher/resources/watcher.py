@@ -110,7 +110,6 @@ def watch(remote, watching=['*'], message_log=logger, period=120.0, wait=10.0, c
                     if len(data) == 0:
 
                         logger.warning('Watcher: did not find any pods under %s.' % cluster)
-                        continue
 
                     #
                     # - Store current indeces in dict of {key: [list of found indeces]}
@@ -194,7 +193,7 @@ def watch(remote, watching=['*'], message_log=logger, period=120.0, wait=10.0, c
                         #
                         if not name in store_health[cluster]:
 
-                            store_health[cluster][name] = {'remaining': checks, 'activity': 'stagnant', 'up': health['up'], 'down': health['down']}
+                            store_health[cluster][name] = {'remaining': checks, 'activity': 'stagnant'}
 
                         #
                         # - Cluster healthy and stable
@@ -230,7 +229,18 @@ def watch(remote, watching=['*'], message_log=logger, period=120.0, wait=10.0, c
                             store_health[cluster][name]['activity'] = 'stagnant'
 
                         store_health[cluster][name]['down'] = health['down']
-                        store_health[cluster][name]['up'] = health['up']                        
+                        store_health[cluster][name]['up'] = health['up']
+
+                    #
+                    # - Check if any application has disappeared entirely
+                    #
+                    for name, health in store_health[cluster].iteritems():
+
+                        if name not in curr_health:
+
+                            store_health[cluster][name] = {'remaining': 0, 'activity': 'absent', 'up': 0, 'down': 0}
+                            publish.insert(cluster, name, 'lost_indeces', (', '.join(map(str, store_indeces[cluster][name]))))
+                            publish.insert(cluster, name, 'changed_base_index', '#%d to None' % (str(sorted(store_indeces[cluster][name])[0])))
 
                 time.sleep(wait)
 
@@ -240,19 +250,19 @@ def watch(remote, watching=['*'], message_log=logger, period=120.0, wait=10.0, c
             #
             for cluster, stored in store_health.iteritems():
                 
-                for key, health in stored.iteritems():
+                for name, health in stored.iteritems():
 
-                    if True: #not health['remaining'] > 0:
+                    if 'remaining' in health: #not health['remaining'] > 0:
 
                         del(health['remaining'])
-                        publish.insert(cluster, key, 'health', dict(health))
+                        publish.insert(cluster, name, 'health', dict(health))
 
                     #
                     # - Reset checks count for next period
                     #
-                    store_health[cluster][key]['remaining'] = checks
+                    store_health[cluster][name]['remaining'] = checks
 
-            logger.info(publish.out())
+            message_log.info(publish.out())
 
             time.sleep(period)
 
@@ -286,7 +296,40 @@ if __name__ == '__main__':
         portal = lines[0]
         assert portal, '/opt/watcher/.portal not found (pod not yet configured ?)'
         logger.debug('using proxy @ %s' % portal)
-            
+        
+        #
+        # - Prepare message logging
+        #
+        from logging import INFO, Formatter
+        from logging.config import fileConfig
+        from logging.handlers import RotatingFileHandler
+
+        #: the location on disk used for logging watcher messages
+        message_file = '/var/log/watcher.log'
+
+        #
+        # - load our logging configuration from config/log.cfg
+        # - make sure to not reset existing loggers
+        #
+        fileConfig('/opt/watcher/config/log.cfg')
+
+        #
+        # - add a small capacity rotating log
+        # - this will be persisted in the container's filesystem and retrieved via /log requests
+        # - an IOError here would mean we don't have the permission to write to /var/log for some reason
+        #
+        message_log = logging.getLogger('watcher')
+
+        try:
+
+            handler = RotatingFileHandler(message_file, maxBytes=32764, backupCount=3)
+            handler.setLevel(INFO)
+            handler.setFormatter(Formatter('%(message)s'))
+            message_log.addHandler(handler)
+
+        except IOError:
+
+            logger.warning('Message logger not enabled')
         #
         # - Remote for direct communication with the portal
         #
@@ -310,7 +353,7 @@ if __name__ == '__main__':
             return js
         
         # Run the watcher routine
-        watch(_remote, clusters)        
+        watch(_remote, clusters, message_log=message_log)        
 
     except Exception as failure:
 

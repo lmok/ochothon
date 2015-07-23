@@ -15,16 +15,21 @@
 # limitations under the License.
 #
 import logging
-
+import json
+import os
+from ochopod.core.utils import shell
 from ochopod.bindings.ec2.marathon import Pod
 from ochopod.models.piped import Actor as Piped
 from ochopod.models.reactive import Actor as Reactive
+from jinja2 import Environment, FileSystemLoader
 
 logger = logging.getLogger('ochopod')
 
 if __name__ == '__main__':
 
-	class Model(Reactive):
+    cfg = json.loads(os.environ['pod'])
+
+    class Model(Reactive):
 
         depends_on = ['portal']
 
@@ -32,6 +37,26 @@ if __name__ == '__main__':
 
         cwd = '/opt/watcher'
         pipe_subprocess = True
+
+        def initialize(self):
+
+            splunk = cfg['splunk']
+
+            env = Environment(loader=FileSystemLoader('/opt/watcher/templates'))
+            template = env.get_template('props.conf')
+            
+            with open('/opt/splunkforwarder/etc/system/local/props.conf', 'wb') as f:
+                f.write(template.render(
+                    {
+                        'sourcetype': splunk['sourcetype']
+                    }))
+
+            shell('splunk start --accept-license && splunk edit user admin -password foo -auth admin:changeme')
+            
+            for url in splunk['forward'].split(','):
+                shell('splunk add forward-server %s' % url)
+
+            shell('touch /var/log/watcher.log && splunk add monitor /var/log/watcher.log -index service -sourcetype %s' % splunk['sourcetype'])
 
         def can_configure(self, cluster):
 
@@ -44,12 +69,12 @@ if __name__ == '__main__':
 
             #
             # - look the ochothon portal up @ TCP 9000
-            # - update the resulting connection string into /opt/scaler.portal
-            # - this will be used by the scaler to poll and scale
+            # - update the resulting connection string into /opt/watcher.portal 
+            # - this will be used by the watcher to poll for health
             #
-            with open('/opt/scaler/.portal', 'w') as f:
+            with open('/opt/watcher/.portal', 'w') as f:
                 f.write(cluster.grep('portal', 9000))
 
-            return 'python watcher.py', {}
+            return 'python -u watcher.py', {}
 
     Pod().boot(Strategy, model=Model)
