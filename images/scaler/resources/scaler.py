@@ -24,8 +24,43 @@ from os.path import basename, expanduser, isfile
 from subprocess import Popen, PIPE
 from ochopod.core.fsm import diagnostic
 from ochopod.core.utils import retry, shell
+from pykka import ThreadingActor, ThreadingFuture, Timeout, ActorRegistry
+from pykka.exceptions import ActorDeadError
 
 logger = logging.getLogger('ochopod')
+
+class Scaler(ThreadingActor):
+
+    def __init__(self, remote, cluster, haproxy, period=30.0, reps=5):
+
+            super(Scaler, self).__init__() 
+
+            self.remote = remote
+            self.cluster = cluster
+            self.haproxy = haproxy
+            self.period = period
+            self.reps = reps
+
+    def on_start(self):
+
+        logger.info('Starting Scaler for %s...' % self.cluster)
+        self.actor_ref.tell({'action': 'scale'})
+
+    def on_receive(self, msg):
+
+        if 'action' in msg and msg['action'] == 'scale':
+
+            _proxyscale(remote=self.remote, 
+                        cluster=self.cluster, 
+                        haproxy=self.haproxy, 
+                        period=self.period, 
+                        reps=self.reps)
+
+            self.actor_ref.tell({'action': 'scale'})
+
+    def on_stop(self):
+
+        logger.info('Stopping Scaler actor for %s' % cluster)
 
 def output(js, cluster):
     """
@@ -53,7 +88,7 @@ def output(js, cluster):
 
             logger.info('Scaling %s SUCCESS. %d/%d pods are running under %s' % (cluster, data['running'], data['requested'], name))
 
-def proxyscale(remote, clusters, haproxies, period=300.0, reps=5):
+def _proxyscale(remote, cluster, haproxy, period=300.0, reps=5):
     """
         Scales clusters under provided cluster glob patterns according to their load. This is checked through HAproxy pods.
 
@@ -112,147 +147,139 @@ def proxyscale(remote, clusters, haproxies, period=300.0, reps=5):
     # - Check stats this many times to get an average of session rate (since HAProxy only uses 1 second intervals)
     # - I.e. 5 repetitions averages session rates 5 times with a 1 sec sleep between
     #
-    reps = 5
+    reps = reps
 
     #
     # - If pods were recently scaled, sleep for half the time to re-poll cluster status quickly
     #
     recent = False
 
-    while True:
+    #
+    # - Find our HAProxy instance
+    #
+    js = remote('port 9002 %s -j' % haproxy)
+
+    if not js['ok']:
+
+        logger.warning('Communication with portal when looking for HAProxy %s FAILED' % haproxy)
+        return
+
+    outs = json.loads(js['out'])
+
+    if not len(outs) == 1:
+
+        logger.warning('Did not find 1 HAProxy under %s (found %d)' % (haproxy, len(outs)))
+        return
+    
+    key = outs.keys()[0]
+
+    url = '%s:%s' % (outs[key]['ip'], outs[key]['ports'])
+
+    #
+    # - Average sessions/second rate over reps # of repetitions
+    #
+    avg_sessions = 0
+    
+    #
+    # - Average number of open threads in Flask servers over reps # of repetitions
+    #
+    avg_threads = 0
+    
+    #
+    # - Number of Flasks
+    #
+    num = 0
+
+    for i in range(reps):
+
+        time.sleep(1)
 
         #
-        # - Wait for period minus polling reps
+        # - Number of pods up & number of pods with running sub processes
         #
-        time.sleep(period - reps if not recent else period/2 - reps)
+        js = remote('grep %s -j' % cluster)
         
-        for i, cluster in enumerate(clusters):
+        if not js['ok']:
 
-            #
-            # - Get haproxy... hardcoded for now
-            #
-            haproxy = haproxies[i]
-            js = remote('port 9002 %s -j' % haproxy)
+            logger.warning('Communication with portal during pre-scale grep FAILED.')
+            continue
 
-            if not js['ok']:
+        outs = json.loads(js['out'])
+        ok = sum(1 for key, data in outs.iteritems() if data['process'] == 'running')
+        num = len(outs)
+        
+        #
+        # - Nothing is running yet, try again next time
+        #
+        if ok == 0:
 
-                logger.warning('Communication with portal when looking for HAproxy %s FAILED' % haproxy)
-                continue
+            logger.warning('Did not find running scalees.')
+            continue
+        
+        #
+        # - Running average for threads
+        #
+        js = remote('poll %s -j' % cluster)
+        
+        if not js['ok']:
 
-            outs = json.loads(js['out'])
+            logger.warning('Communication with portal during metrics gathering FAILED.')
+            continue
+        
+        outs = json.loads(js['out'])
+        threads = sum(item['threads'] for key, item in outs.iteritems() if 'threads' in item)
+        avg_threads = avg_threads + (float(threads)/ok - avg_threads)/(i + 1)
 
-            if not len(outs) == 1:
+        #
+        # - Get the stats from HAproxy
+        # - This will put the csv-formatted stats for the BACKEND servers into a nice little dict 
+        # - Look at the haproxy pod for more info (frontend.cfg and local.cfg) 
+        #
+        @retry(timeout=30.0, pause=0)
+        def _backend():   
+            reply = requests.get('http://%s/;csv' % url, auth=('olivier', 'likeschinesefood'))
+            code = reply.status_code
+            assert code == 200 or code == 201, 'Polling HAProxy failed (HTTP %d)' % code
+            lines = map(lambda x: x.split(','), reply.text.splitlines())
+            return dict(zip(lines[0], filter(lambda x: x[0] == 'local' and x[1] == 'BACKEND', lines)[0]))
 
-                logger.warning('Did not find 1 HAProxy under %s (found %d)' % (haproxy, len(outs)))
-                continue
+        #
+        # - Running average for session rate
+        #
+        backend = _backend()
+        avg_sessions = avg_sessions + (float(backend['rate'])/ok - avg_sessions)/(i + 1)
+
+    logger.info('Scaler gathered metrics for %s --> average session rate: %d, average thread rate: %d' % (cluster, avg_sessions, avg_threads))
+
+    #
+    # - Scale up/down based on how stressed the cluster is and if resources
+    # - are within the limits
+    #
+    js = {}
+
+    if (avg_sessions > ceiling_sessions or avg_threads > ceiling_threads) and num + unit <= lim:
+
+            js = remote('scale %s -i %d -j' % (cluster, num + unit))
+            recent = True
+
+    elif avg_sessions < floor_sessions and avg_threads < floor_threads and num > unit:
             
-            key = outs.keys()[0]
+            js = remote('scale %s -i %d -j' % (cluster, num - unit))
+            recent = True
 
-            url = '%s:%s' % (outs[key]['ip'], outs[key]['ports'])
+    #
+    # - Output for calls to scale
+    #
+    if not js == {}:
 
-            #
-            # - Average sessions/second rate over reps # of repetitions
-            #
-            avg_sessions = 0
-            
-            #
-            # - Average number of open threads in Flask servers over reps # of repetitions
-            #
-            avg_threads = 0
-            
-            #
-            # - Number of Flasks
-            #
-            num = 0
+        output(js, cluster)
 
-            for i in range(reps):
+    #
+    # - Wait for period minus polling reps
+    #
+    time.sleep(period - reps if not recent else period/2 - reps)
 
-                time.sleep(1)
-
-                #
-                # - Number of pods up & number of pods with running sub processes
-                #
-                js = remote('grep %s -j' % cluster)
-                
-                if not js['ok']:
-
-                    logger.warning('Communication with portal during pre-scale grep FAILED.')
-                    continue
-
-                outs = json.loads(js['out'])
-                ok = sum(1 for key, data in outs.iteritems() if data['process'] == 'running')
-                num = len(outs)
-                
-                #
-                # - Nothing is running yet, try again next time
-                #
-                if ok == 0:
-
-                    logger.warning('Did not find running scalees.')
-                    continue
-                
-                #
-                # - Running average for threads
-                #
-                js = remote('poll %s -j' % cluster)
-                
-                if not js['ok']:
-
-                    logger.warning('Communication with portal during metrics gathering FAILED.')
-                    continue
-                
-                outs = json.loads(js['out'])
-                threads = sum(item['threads'] for key, item in outs.iteritems() if 'threads' in item)
-                avg_threads = avg_threads + (float(threads)/ok - avg_threads)/(i + 1)
-
-                #
-                # - Get the stats from HAproxy
-                # - This will put the csv-formatted stats for the BACKEND servers into a nice little dict 
-                # - Look at the haproxy pod for more info (frontend.cfg and local.cfg) 
-                #
-                @retry(timeout=30.0, pause=0)
-                def _backend():   
-                    reply = requests.get('http://%s/;csv' % url, auth=('olivier', 'likeschinesefood'))
-                    code = reply.status_code
-                    assert code == 200 or code == 201, 'Polling HAProxy failed (HTTP %d)' % code
-                    lines = map(lambda x: x.split(','), reply.text.splitlines())
-                    return dict(zip(lines[0], filter(lambda x: x[0] == 'local' and x[1] == 'BACKEND', lines)[0]))
-
-                #
-                # - Running average for session rate
-                #
-                backend = _backend()
-                avg_sessions = avg_sessions + (float(backend['rate'])/ok - avg_sessions)/(i + 1)
-
-            logger.info('Scaler gathered metrics for %s --> average session rate: %d, average thread rate: %d' % (cluster, avg_sessions, avg_threads))
-
-            #
-            # - Scale up/down based on how stressed the cluster is and if resources
-            # - are within the limits
-            #
-            js = {}
-
-            if (avg_sessions > ceiling_sessions or avg_threads > ceiling_threads) and num + unit <= lim:
-
-                    js = remote('scale %s -i %d -j' % (cluster, num + unit))
-                    recent = True
-
-            elif avg_sessions < floor_sessions and avg_threads < floor_threads and num > unit:
-                    
-                    js = remote('scale %s -i %d -j' % (cluster, num - unit))
-                    recent = True
-
-            else:
-                    recent = False
-
-            #
-            # - Output for calls to scale
-            #
-            if not js == {}:
-
-                output(js, cluster)
-
-def simplescale(remote, clusters, period=300.0):
+def _simplescale(remote, clusters, period=300.0):
     """
         Scales the cluster automatically with a simple routine.
 
@@ -322,7 +349,7 @@ def simplescale(remote, clusters, period=300.0):
 
                 output(js, cluster)
 
-def pulse(remote, clusters, period=300.0):
+def _pulse(remote, clusters, period=300.0):
     """
         Scales cluster up and down periodically
 
@@ -363,6 +390,8 @@ def pulse(remote, clusters, period=300.0):
 
 if __name__ == '__main__':
 
+    scalers = []
+
     try:
 
         #
@@ -377,7 +406,7 @@ if __name__ == '__main__':
         #
         # - Check for passed set of scalee clusters, haproxies, and time period in deployment yaml
         #
-        clusters = env['SCALEES'].split(',') if 'SCALEES' in env else []
+        scalees = env['SCALEES'].split(',') if 'SCALEES' in env else []
 
         haproxies = env['HAPROXIES'].split(',') if 'HAPROXIES' in env else []
             
@@ -413,11 +442,15 @@ if __name__ == '__main__':
             logger.debug('<- %s (took %.2f seconds) ->\n\t%s' % (portal, elapsed, '\n\t'.join(js['out'].split('\n'))))
             return js
 
-        # Use our very simple autoscaling routine
-        proxyscale(_remote, clusters, haproxies, period)
+        #
+        # - Initialise the scaler actors and start
+        #
+        scalers = [[Scaler(_remote, cluster, haproxy), cluster, haproxy] for cluster, haproxy in zip(scalees, haproxies)]
+        refs = [scaler.start(_remote, cluster, haproxy) for scaler, cluster, haproxy in scalers]
 
     except Exception as failure:
 
+        logger.fatal('Error on line %s' % (sys.exc_info()[-1].tb_lineno))
         logger.fatal('unexpected condition -> %s' % diagnostic(failure))
 
     finally:
