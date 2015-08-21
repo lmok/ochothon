@@ -42,15 +42,25 @@ def go():
 
         def customize(self, parser):
 
-            parser.add_argument('yaml', nargs=1, help='YAML file')
+            parser.add_argument('yaml', nargs=1, help='YAML file, or verbatim json string if -v')
             parser.add_argument('clusters', type=str, nargs='*', default='*', help='1+ clusters (can be a glob pattern, e.g foo*)')
             parser.add_argument('-j', action='store_true', dest='json', help='json output')
+            parser.add_argument('-v', dest='verbatim', action='store_true', help='interpret yaml argument as a json string payload')
 
         def body(self, args, proxy):
 
             try:
-                with open(args.yaml[0], 'r') as f:
-                    payload = yaml.load(f)
+
+                payload = {}
+
+                if not args.verbatim:
+
+                    with open(args.yaml[0], 'r') as f:
+                        payload = yaml.load(f)
+
+                else:
+
+                    payload = json.loads(args.yaml[0])
 
                 total = 0
                 merged = {}
@@ -69,7 +79,7 @@ def go():
 
             except IOError:
 
-                logger.info('unable to load %s' % args.yaml[0])
+                logger.info('unable to load %s as yaml (maybe you want -v)' % args.yaml[0])
 
             except YAMLError as failure:
 

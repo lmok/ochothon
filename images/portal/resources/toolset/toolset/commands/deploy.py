@@ -36,7 +36,7 @@ logger = logging.getLogger('ochopod')
 
 class _Automation(Thread):
 
-    def __init__(self, proxy, template, overrides, namespace, pods, suffix, timeout, strict):
+    def __init__(self, proxy, template, overrides, namespace, pods, suffix, timeout, strict, force):
         super(_Automation, self).__init__()
 
         self.namespace = namespace
@@ -52,6 +52,7 @@ class _Automation(Thread):
         self.suffix = suffix
         self.strict = strict
         self.timeout = max(timeout, 5)
+        self.force = force
 
         self.start()
 
@@ -182,7 +183,6 @@ class _Automation(Thread):
                                 'type': 'DOCKER',
                                 'docker':
                                     {
-                                        'forcePullImage': True,
                                         'image': cfg['image'],
                                         'network': 'BRIDGE',
                                         'portMappings': ports
@@ -202,6 +202,12 @@ class _Automation(Thread):
                                     ]
                             }
                     }
+
+                #
+                # - if we force pull image, forcePullImage
+                #
+                if self.force:
+                    spec['container']['docker']['forcePullImage'] = True
 
                 #
                 # - if we have a 'verbatim' block in our image definition yaml, merge it now
@@ -301,6 +307,7 @@ def go():
         def customize(self, parser):
 
             parser.add_argument('containers', type=str, nargs='+', help='1+ YAML definitions (e.g marathon.yml)')
+            parser.add_argument('-f', action='store_true', dest='force', help='force pull image')
             parser.add_argument('-j', action='store_true', dest='json', help='json output')
             parser.add_argument('-n', action='store', dest='namespace', type=str, default='marathon', help='namespace')
             parser.add_argument('-o', action='store', dest='overrides', type=str, nargs='+', help='overrides YAML file(s)')
@@ -346,7 +353,8 @@ def go():
                 args.pods,
                 args.suffix,
                 args.timeout,
-                args.strict) for template in args.containers}
+                args.strict,
+                args.force) for template in args.containers}
 
             #
             # - wait for all our threads to join
